@@ -1,0 +1,174 @@
+diff --git a/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+Methods_Reproductive.h b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+Methods_Reproductive.h
+new file mode 100644
+index 0000000..d4e3a1a
+--- /dev/null
++++ b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+Methods_Reproductive.h
+@@ -0,0 +1,12 @@
++//
++//  RCTAppleHealthKit+Methods_Reproductive.h
++//  Oestra patch: menstrual flow (HealthKit category)
++//
++
++#import "RCTAppleHealthKit.h"
++
++@interface RCTAppleHealthKit (Methods_Reproductive)
++
++- (void)reproductive_getMenstrualFlowSamples:(NSDictionary *)input callback:(RCTResponseSenderBlock)callback;
++
++@end
+diff --git a/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+Methods_Reproductive.m b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+Methods_Reproductive.m
+new file mode 100644
+index 0000000..b7c8e2d
+--- /dev/null
++++ b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+Methods_Reproductive.m
+@@ -0,0 +1,77 @@
++//
++//  RCTAppleHealthKit+Methods_Reproductive.m
++//  Oestra patch: HKCategoryTypeIdentifierMenstrualFlow
++//
++
++#import "RCTAppleHealthKit+Methods_Reproductive.h"
++#import "RCTAppleHealthKit+Utils.h"
++
++@implementation RCTAppleHealthKit (Methods_Reproductive)
++
++static NSString *RNH_StringForMenstrualFlow(NSInteger value) {
++  switch (value) {
++    case HKCategoryValueMenstrualFlowNone:
++      return @"none";
++    case HKCategoryValueMenstrualFlowLight:
++      return @"light";
++    case HKCategoryValueMenstrualFlowMedium:
++      return @"medium";
++    case HKCategoryValueMenstrualFlowHeavy:
++      return @"heavy";
++    case HKCategoryValueMenstrualFlowUnspecified:
++    default:
++      return @"unspecified";
++  }
++}
++
++- (void)reproductive_getMenstrualFlowSamples:(NSDictionary *)input callback:(RCTResponseSenderBlock)callback
++{
++  NSDate *startDate = [RCTAppleHealthKit dateFromOptions:input key:@"startDate" withDefault:nil];
++  NSDate *endDate = [RCTAppleHealthKit dateFromOptions:input key:@"endDate" withDefault:[NSDate date]];
++  double limit = [RCTAppleHealthKit doubleFromOptions:input key:@"limit" withDefault:HKObjectQueryNoLimit];
++
++  NSSortDescriptor *timeSortDescriptor = [[NSSortDescriptor alloc]
++      initWithKey:HKSampleSortIdentifierEndDate
++      ascending:NO
++  ];
++
++  HKCategoryType *type = [HKCategoryType categoryTypeForIdentifier:HKCategoryTypeIdentifierMenstrualFlow];
++  NSPredicate *predicate = [RCTAppleHealthKit predicateForSamplesBetweenDates:startDate endDate:endDate];
++
++  HKSampleQuery *query = [[HKSampleQuery alloc]
++      initWithSampleType:type
++      predicate:predicate
++      limit: limit
++      sortDescriptors:@[timeSortDescriptor]
++      resultsHandler:^(HKSampleQuery *query, NSArray *results, NSError *error) {
++
++        if (error != nil) {
++          NSLog(@"RNHealth menstrual flow error: %@", error);
++          callback(@[RCTMakeError(@"error fetching menstrual flow samples", error, nil)]);
++          return;
++        }
++
++        NSMutableArray *data = [NSMutableArray arrayWithCapacity:10];
++
++        for (HKCategorySample *sample in results) {
++          NSString *startDateString = [RCTAppleHealthKit buildISO8601StringFromDate:sample.startDate];
++          NSString *endDateString = [RCTAppleHealthKit buildISO8601StringFromDate:sample.endDate];
++          NSString *flowString = RNH_StringForMenstrualFlow(sample.value);
++
++          NSDictionary *elem = @{
++            @"id" : [[sample UUID] UUIDString],
++            @"value" : @(sample.value),
++            @"valueString" : flowString,
++            @"startDate" : startDateString,
++            @"endDate" : endDateString,
++          };
++
++          [data addObject:elem];
++        }
++        callback(@[[NSNull null], data]);
++      }
++  ];
++  [self.healthStore executeQuery:query];
++}
++
++@end
+diff --git a/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+TypesAndPermissions.m b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+TypesAndPermissions.m
+--- a/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+TypesAndPermissions.m
++++ b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit+TypesAndPermissions.m
+@@ -224,6 +224,11 @@
+         return [HKObjectType categoryTypeForIdentifier:HKCategoryTypeIdentifierSleepAnalysis];
+     }
+ 
++    // Reproductive Health (read)
++    if ([@"MenstrualFlow" isEqualToString: key]) {
++        return [HKObjectType categoryTypeForIdentifier:HKCategoryTypeIdentifierMenstrualFlow];
++    }
++
+     // workouts
+     if ([@"MindfulSession" isEqualToString: key] && systemVersion >= 10.0) {
+         return [HKObjectType categoryTypeForIdentifier:HKCategoryTypeIdentifierMindfulSession];
+diff --git a/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit.m b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit.m
+--- a/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit.m
++++ b/node_modules/react-native-health/RCTAppleHealthKit/RCTAppleHealthKit.m
+@@ -18,6 +18,7 @@
+ #import "RCTAppleHealthKit+Methods_Results.h"
+ #import "RCTAppleHealthKit+Methods_Sleep.h"
+ #import "RCTAppleHealthKit+Methods_Mindfulness.h"
++#import "RCTAppleHealthKit+Methods_Reproductive.h"
+ #import "RCTAppleHealthKit+Methods_Workout.h"
+ #import "RCTAppleHealthKit+Methods_LabTests.h"
+ #import "RCTAppleHealthKit+Methods_Hearing.h"
+@@ -549,6 +550,12 @@
+     [self mindfulness_saveMindfulSession:input callback:callback];
+ }
+ 
++RCT_EXPORT_METHOD(getMenstrualFlowSamples:(NSDictionary *)input callback:(RCTResponseSenderBlock)callback)
++{
++    [self _initializeHealthStore];
++    [self reproductive_getMenstrualFlowSamples:input callback:callback];
++}
++
+ RCT_EXPORT_METHOD(saveWorkout:(NSDictionary *)input callback:(RCTResponseSenderBlock)callback)
+ {
+     [self _initializeHealthStore];
+diff --git a/node_modules/react-native-health/index.d.ts b/node_modules/react-native-health/index.d.ts
+--- a/node_modules/react-native-health/index.d.ts
++++ b/node_modules/react-native-health/index.d.ts
+@@ -358,6 +358,11 @@
+     getMindfulSession(
+       options: HealthInputOptions,
+       callback: (err: string, results: Array<HealthValue>) => void,
++    ): void
++
++    getMenstrualFlowSamples(
++      options: HealthInputOptions,
++      callback: (err: string, results: Array<HealthValue & { valueString: string }>) => void,
+     ): void
+ 
+     saveMindfulSession(
+@@ -795,6 +800,7 @@
+     Height = 'Height',
+     LeanBodyMass = 'LeanBodyMass',
+     MindfulSession = 'MindfulSession',
++    MenstrualFlow = 'MenstrualFlow',
+     NikeFuel = 'NikeFuel',
+     PeakFlow = 'PeakFlow',
+     RespiratoryRate = 'RespiratoryRate',
+diff --git a/node_modules/react-native-health/src/constants/Permissions.js b/node_modules/react-native-health/src/constants/Permissions.js
+--- a/node_modules/react-native-health/src/constants/Permissions.js
++++ b/node_modules/react-native-health/src/constants/Permissions.js
+@@ -82,6 +82,7 @@
+   Height: 'Height',
+   LeanBodyMass: 'LeanBodyMass',
+   MindfulSession: 'MindfulSession',
++  MenstrualFlow: 'MenstrualFlow',
+   NikeFuel: 'NikeFuel',
+   PeakFlow: 'PeakFlow',
+   RespiratoryRate: 'RespiratoryRate',

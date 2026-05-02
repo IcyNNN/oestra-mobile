@@ -1,60 +1,101 @@
-import Constants from "expo-constants";
+import { supabase } from "./supabase";
 
-export interface ChatPayloadMessage {
-  role: "user" | "assistant";
-  content: string;
+/** Edge Function `chat` JSON response */
+export interface ChatEdgeResponse {
+  session_id: string;
+  reply: string;
+  metadata: Record<string, unknown> | null;
 }
 
-export async function sendMessage(
-  messages: ChatPayloadMessage[],
-  systemPrompt: string,
-  maxTokens: number = 1024,
-): Promise<string> {
-  try {
-    const runtimeExtra = (Constants.expoConfig?.extra ?? {}) as Record<string, string | undefined>;
-    const apiKey =
-      process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY ?? runtimeExtra.EXPO_PUBLIC_ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      throw new Error("Anthropic API key is missing.");
+/** Parse JSON body from Supabase FunctionsHttpError (non-2xx). */
+async function readInvokeErrorDetail(error: unknown): Promise<string> {
+  const fallback =
+    error instanceof Error ? error.message : "Edge Function returned a non-2xx status code";
+
+  if (
+    error &&
+    typeof error === "object" &&
+    "context" in error &&
+    error.context instanceof Response
+  ) {
+    try {
+      const body = (await error.context.clone().json()) as Record<string, unknown>;
+      if (typeof body.error === "string") {
+        return body.error;
+      }
+      if (typeof body.message === "string") {
+        return body.message;
+      }
+    } catch {
+      /* response body not JSON */
     }
-
-    // TODO: 生产环境应改为通过后端代理调用，不在客户端暴露API key
-    // Difference from Next.js version: direct RN fetch call instead of server-side streamText.
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-5-20250929",
-        max_tokens: maxTokens,
-        system: systemPrompt,
-        messages,
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      const errMessage =
-        data?.error?.message ||
-        data?.message ||
-        "Anthropic request failed. Please try again.";
-      throw new Error(errMessage);
-    }
-
-    const text = data?.content?.[0]?.text;
-    if (!text || typeof text !== "string") {
-      throw new Error("No AI response text returned.");
-    }
-
-    return text;
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Unable to get AI response right now.";
-    throw new Error(`Oestra暂时无法回应：${message}`);
   }
+
+  return fallback;
+}
+
+async function invokeChatOnce(
+  trimmed: string,
+  sessionId: string | null | undefined,
+): Promise<{ data: ChatEdgeResponse | null; error: unknown }> {
+  return supabase.functions.invoke<ChatEdgeResponse>("chat", {
+    body: {
+      session_id: sessionId ?? undefined,
+      message: trimmed,
+    },
+  });
+}
+
+/**
+ * Send one user turn through the Supabase Edge Function (auth + persistence + Anthropic on server).
+ */
+export async function sendChatMessage(
+  message: string,
+  sessionId?: string | null,
+): Promise<ChatEdgeResponse> {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    throw new Error("消息不能为空。");
+  }
+
+  let { data, error } = await invokeChatOnce(trimmed, sessionId);
+
+  // Stale or foreign session_id → 403; retry once without session so server creates a new chat_sessions row.
+  if (error) {
+    const detail = await readInvokeErrorDetail(error);
+    const shouldRetryFresh =
+      Boolean(sessionId) &&
+      (detail.includes("Invalid session_id") || detail.includes("session_id for this user"));
+
+    if (shouldRetryFresh) {
+      ({ data, error } = await invokeChatOnce(trimmed, null));
+    }
+
+  if (error) {
+    let finalDetail = await readInvokeErrorDetail(error);
+    const lower = finalDetail.toLowerCase();
+    if (
+      lower.includes("not found") &&
+      (lower.includes("function") || lower.includes("edge"))
+    ) {
+      finalDetail +=
+        " 请在项目根目录执行：supabase login && supabase link --project-ref <你的项目ID> && supabase functions deploy chat，并在 Dashboard → Edge Functions 中确认已有 chat。";
+    }
+    throw new Error(finalDetail);
+  }
+  }
+
+  if (!data?.reply || typeof data.reply !== "string") {
+    throw new Error("没有收到 AI 回复。");
+  }
+
+  if (!data.session_id) {
+    throw new Error("服务器未返回 session_id。");
+  }
+
+  return {
+    session_id: data.session_id,
+    reply: data.reply,
+    metadata: data.metadata ?? null,
+  };
 }

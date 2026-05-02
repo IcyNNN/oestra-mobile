@@ -47,6 +47,7 @@ interface DailyRecord {
   type: QuickType;
   value: string;
   createdAt: string;
+  source: "supabase" | "local";
 }
 
 function inferTypeFromText(input: string): QuickType {
@@ -76,12 +77,15 @@ export default function HomeScreen() {
   const [recordInput, setRecordInput] = useState("");
   const [records, setRecords] = useState<DailyRecord[]>([]);
   const [storageKey, setStorageKey] = useState("oestra-daily-records-anon");
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [syncHint, setSyncHint] = useState<string | null>(null);
 
   useEffect(() => {
     const loadCycleDay = async () => {
       const { data: authData } = await supabase.auth.getUser();
       const userId = authData.user?.id;
       if (userId) {
+        setCurrentUserId(userId);
         setStorageKey(`oestra-daily-records-${userId}`);
       }
 
@@ -104,6 +108,64 @@ export default function HomeScreen() {
 
   useEffect(() => {
     const loadRecords = async () => {
+      if (currentUserId) {
+        const { data, error } = await supabase
+          .from("cycle_logs")
+          .select("*")
+          .eq("user_id", currentUserId)
+          .order("created_at", { ascending: false })
+          .limit(60);
+
+        if (!error && data) {
+          // Difference from Next.js typed DTOs: this migration maps flexible legacy columns defensively.
+          const mapped = data
+            .map((row: Record<string, unknown>) => {
+              const createdAt =
+                String(row.created_at || row.logged_at || row.log_date || new Date().toISOString());
+              const contentCandidates = [
+                row.content,
+                row.notes,
+                row.note,
+                row.description,
+                row.summary,
+              ].filter(Boolean);
+              const inferredValue =
+                String(
+                  contentCandidates[0] ||
+                    row.mood ||
+                    row.energy ||
+                    row.symptom ||
+                    row.symptoms ||
+                    "",
+                ).trim() || "(空白记录)";
+
+              let inferredType = String(row.record_type || row.type || row.kind || "");
+              if (!inferredType) {
+                if (row.mood) inferredType = "mood";
+                else if (row.energy) inferredType = "energy";
+                else if (row.symptom || row.symptoms) inferredType = "symptom";
+                else inferredType = "mood";
+              }
+
+              if (!["mood", "energy", "symptom"].includes(inferredType)) {
+                inferredType = inferTypeFromText(inferredValue);
+              }
+
+              return {
+                id: String(row.id || `${createdAt}-${Math.random().toString(36).slice(2, 8)}`),
+                type: inferredType as QuickType,
+                value: inferredValue,
+                createdAt,
+                source: "supabase" as const,
+              };
+            })
+            .filter((item) => item.value && item.value !== "(空白记录)");
+          setRecords(mapped);
+          setSyncHint(null);
+          return;
+        }
+      }
+
       const raw = await AsyncStorage.getItem(storageKey);
       if (!raw) {
         setRecords([]);
@@ -111,6 +173,7 @@ export default function HomeScreen() {
       }
       try {
         setRecords(JSON.parse(raw) as DailyRecord[]);
+        setSyncHint("当前展示的是本地记录，稍后会尝试同步到云端。");
       } catch {
         setRecords([]);
       }
@@ -130,10 +193,51 @@ export default function HomeScreen() {
       type,
       value,
       createdAt: new Date().toISOString(),
+      source: "local",
     };
-    const next = [newRecord, ...records].slice(0, 50);
+    let persistedRecord = newRecord;
+
+    if (currentUserId) {
+      const payloadAttempts: Array<Record<string, unknown>> = [
+        { user_id: currentUserId, record_type: type, content: value, created_at: newRecord.createdAt },
+        { user_id: currentUserId, type, notes: value, created_at: newRecord.createdAt },
+        { user_id: currentUserId, kind: type, note: value, logged_at: newRecord.createdAt },
+        {
+          user_id: currentUserId,
+          mood: type === "mood" ? value : null,
+          energy: type === "energy" ? value : null,
+          symptom: type === "symptom" ? value : null,
+          notes: value,
+          created_at: newRecord.createdAt,
+        },
+      ];
+
+      for (const payload of payloadAttempts) {
+        const { data, error } = await supabase.from("cycle_logs").insert(payload).select("*").maybeSingle();
+        if (!error && data) {
+          persistedRecord = {
+            id: String((data as Record<string, unknown>).id || newRecord.id),
+            type,
+            value,
+            createdAt: String(
+              (data as Record<string, unknown>).created_at ||
+                (data as Record<string, unknown>).logged_at ||
+                newRecord.createdAt,
+            ),
+            source: "supabase",
+          };
+          setSyncHint(null);
+          break;
+        }
+      }
+    }
+
+    const next = [persistedRecord, ...records].slice(0, 50);
     setRecords(next);
     await AsyncStorage.setItem(storageKey, JSON.stringify(next));
+    if (persistedRecord.source === "local") {
+      setSyncHint("已保存到本地，当前云端写入未成功。");
+    }
     setRecordInput("");
     setSelectedType(null);
   };
@@ -187,6 +291,7 @@ export default function HomeScreen() {
 
       <View className="mt-5 rounded-3xl bg-white p-5">
         <Text className="font-sans-medium text-sm text-oestra-text-light">今天已记录</Text>
+        {syncHint ? <Text className="mt-2 font-sans text-xs text-oestra-text-light">{syncHint}</Text> : null}
         {todaysRecords.length === 0 ? (
           <Text className="mt-3 font-sans text-sm text-oestra-text-light">今天还没有记录。</Text>
         ) : (
@@ -195,6 +300,9 @@ export default function HomeScreen() {
               <View key={record.id} className="rounded-2xl border border-oestra-mist px-4 py-3">
                 <Text className="font-sans-medium text-xs uppercase text-oestra-purple">{record.type}</Text>
                 <Text className="mt-1 font-sans text-sm text-oestra-text">{record.value}</Text>
+                <Text className="mt-1 font-sans text-[10px] text-oestra-text-light">
+                  {record.source === "supabase" ? "云端" : "本地"}
+                </Text>
               </View>
             ))}
           </View>

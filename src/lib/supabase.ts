@@ -1,12 +1,19 @@
 import { createClient } from "@supabase/supabase-js";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
+import { Platform } from "react-native";
 import "react-native-url-polyfill/auto";
 
 const runtimeExtra = (Constants.expoConfig?.extra ?? {}) as Record<string, string | undefined>;
-const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL ?? runtimeExtra.EXPO_PUBLIC_SUPABASE_URL;
+// Expo Web often has empty process.env at runtime; app.config.ts injects into Constants.expoConfig.extra — prefer that first.
+const supabaseUrl =
+  runtimeExtra.EXPO_PUBLIC_SUPABASE_URL ||
+  process.env.EXPO_PUBLIC_SUPABASE_URL ||
+  "";
 const supabaseAnonKey =
-  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? runtimeExtra.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+  runtimeExtra.EXPO_PUBLIC_SUPABASE_ANON_KEY ||
+  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ||
+  "";
 const fallbackUrl = "https://example.supabase.co";
 const fallbackKey = "public-anon-key-placeholder";
 const hasValidConfig = Boolean(supabaseUrl && supabaseAnonKey);
@@ -24,7 +31,7 @@ export const supabase = createClient(supabaseUrl || fallbackUrl, supabaseAnonKey
     storage: AsyncStorage,
     autoRefreshToken: true,
     persistSession: true,
-    // Difference from Next.js web: React Native does not need URL session detection.
-    detectSessionInUrl: false,
+    // Browser preview needs URL fragment/hash handling for OAuth & PKCE session restore.
+    detectSessionInUrl: Platform.OS === "web",
   },
 });

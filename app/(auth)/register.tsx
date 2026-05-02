@@ -19,6 +19,8 @@ export default function RegisterScreen() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [pendingVerifyEmail, setPendingVerifyEmail] = useState<string | null>(null);
+  const [resendLoading, setResendLoading] = useState(false);
 
   const handleRegister = async () => {
     if (!email || !password) {
@@ -48,10 +50,17 @@ export default function RegisterScreen() {
       }
 
       if (!data.session) {
-        setNotice("注册成功，请先去邮箱完成验证，然后再登录。");
+        setPendingVerifyEmail(normalizedEmail);
+        setNotice(
+          "注册已提交。若项目开启了「邮箱验证」，需要点击邮件里的链接后才能登录。\n\n" +
+            "收不到？先看垃圾箱/广告文件夹；Supabase 默认发信易进垃圾箱。\n\n" +
+            "本地预览建议在 Supabase → Authentication → Providers → Email 里暂时关闭「Confirm email」，注册后即可直接进入（无需等邮件）。\n\n" +
+            "生产环境请在 Authentication → Emails 配置自定义 SMTP。",
+        );
         return;
       }
 
+      setPendingVerifyEmail(null);
       router.replace("/onboarding");
     } catch (e) {
       const message = e instanceof Error ? e.message : "注册失败，请稍后重试。";
@@ -91,7 +100,40 @@ export default function RegisterScreen() {
             className="rounded-2xl border border-oestra-mist bg-white px-5 py-4 font-sans text-base text-oestra-text"
           />
           {error ? <Text className="font-sans text-sm text-oestra-blush">{error}</Text> : null}
-          {notice ? <Text className="font-sans text-sm text-oestra-text-light">{notice}</Text> : null}
+          {notice ? (
+            <Text className="font-sans text-sm leading-6 text-oestra-text-light">{notice}</Text>
+          ) : null}
+          {pendingVerifyEmail ? (
+            <Pressable
+              disabled={resendLoading}
+              onPress={async () => {
+                setResendLoading(true);
+                setError(null);
+                try {
+                  const { error: resendErr } = await supabase.auth.resend({
+                    type: "signup",
+                    email: pendingVerifyEmail,
+                  });
+                  if (resendErr) {
+                    throw new Error(resendErr.message);
+                  }
+                  setNotice(
+                    (prev) =>
+                      (prev ? `${prev}\n\n` : "") + "已尝试再次发送验证邮件，请稍等并查看收件箱与垃圾箱。",
+                  );
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : "重发失败。");
+                } finally {
+                  setResendLoading(false);
+                }
+              }}
+              className="items-center rounded-2xl border border-oestra-purple bg-white py-3 disabled:opacity-60"
+            >
+              <Text className="font-sans-medium text-base text-oestra-purple">
+                {resendLoading ? "发送中…" : "重新发送验证邮件"}
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
 
         <View className="mt-auto pb-10">

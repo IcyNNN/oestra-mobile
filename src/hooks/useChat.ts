@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { sendMessage } from "../lib/anthropic";
+import { sendChatMessage } from "../lib/anthropic";
 import { supabase } from "../lib/supabase";
-import { SYSTEM_PROMPT } from "../constants/prompts";
 
 export interface ChatMessage {
   id: string;
@@ -17,7 +16,7 @@ interface UseChatReturn {
   error: string | null;
   sendMessage: (content: string) => Promise<void>;
   loadSession: (sessionId: string) => Promise<void>;
-  createNewSession: () => Promise<string>;
+  createNewSession: () => Promise<void>;
   currentSessionId: string | null;
 }
 
@@ -41,23 +40,10 @@ export function useChat(): UseChatReturn {
   const [error, setError] = useState<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
+  /** Start a fresh thread locally; first message will create the session on the server. */
   const createNewSession = useCallback(async () => {
-    const { data: authData } = await supabase.auth.getUser();
-    const userId = authData.user?.id;
-    if (!userId) throw new Error("请先登录后再开始对话。");
-
-    const { data, error: createError } = await supabase
-      .from("chat_sessions")
-      .insert({ user_id: userId })
-      .select("id")
-      .single();
-    if (createError || !data?.id) {
-      throw new Error(createError?.message || "无法创建会话。");
-    }
-
-    setCurrentSessionId(data.id);
+    setCurrentSessionId(null);
     setMessages([]);
-    return data.id;
   }, []);
 
   const loadSession = useCallback(async (sessionId: string) => {
@@ -70,7 +56,7 @@ export function useChat(): UseChatReturn {
 
     const { data: list } = await supabase
       .from("chat_messages")
-      .select("id, role, content, created_at")
+      .select("id, role, content, created_at, metadata, is_proactive")
       .eq("session_id", sessionId)
       .order("created_at", { ascending: true });
 
@@ -104,59 +90,44 @@ export function useChat(): UseChatReturn {
     bootstrap();
   }, [loadSession]);
 
-  const send = useCallback(async (content: string) => {
-    const trimmed = content.trim();
-    if (!trimmed || isLoading) return;
+  const send = useCallback(
+    async (content: string) => {
+      const trimmed = content.trim();
+      if (!trimmed || isLoading) return;
 
-    setIsLoading(true);
-    setError(null);
+      setIsLoading(true);
+      setError(null);
 
-    const localUserMessage: ChatMessage = {
-      id: `${Date.now()}-user`,
-      role: "user",
-      content: trimmed,
-      createdAt: new Date().toISOString(),
-    };
-    setMessages((prev) => [...prev, localUserMessage]);
-
-    try {
-      const sessionId = currentSessionId ?? (await createNewSession());
-
-      await supabase.from("chat_messages").insert({
-        session_id: sessionId,
+      const tempUserId = `${Date.now()}-user`;
+      const optimisticUser: ChatMessage = {
+        id: tempUserId,
         role: "user",
         content: trimmed,
-      });
-
-      // Difference from Next.js + Vercel AI SDK useChat: RN hook manually builds context and persists.
-      const aiText = await sendMessage(
-        [...messages, localUserMessage].map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
-        SYSTEM_PROMPT,
-      );
-
-      const assistantMessage: ChatMessage = {
-        id: `${Date.now()}-assistant`,
-        role: "assistant",
-        content: aiText,
         createdAt: new Date().toISOString(),
       };
-      setMessages((prev) => [...prev, assistantMessage]);
+      setMessages((prev) => [...prev, optimisticUser]);
 
-      await supabase.from("chat_messages").insert({
-        session_id: sessionId,
-        role: "assistant",
-        content: aiText,
-      });
-    } catch (e) {
-      const message = e instanceof Error ? e.message : "发送失败，请稍后重试。";
-      setError(message);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [createNewSession, currentSessionId, isLoading, messages]);
+      try {
+        const { data: authData } = await supabase.auth.getUser();
+        if (!authData.user?.id) {
+          setMessages((prev) => prev.filter((m) => m.id !== tempUserId));
+          throw new Error("请先登录后再发送消息。");
+        }
+
+        const response = await sendChatMessage(trimmed, currentSessionId);
+
+        setCurrentSessionId(response.session_id);
+        await loadSession(response.session_id);
+      } catch (e) {
+        setMessages((prev) => prev.filter((m) => m.id !== tempUserId));
+        const message = e instanceof Error ? e.message : "发送失败，请稍后重试。";
+        setError(message);
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [currentSessionId, isLoading, loadSession],
+  );
 
   return {
     messages,
