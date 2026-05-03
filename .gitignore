@@ -37,6 +37,9 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# generated native folders
-/ios
-/android
+# generated native folders (ignore contents; track CocoaPods / Gradle entry files for reproducible installs)
+/ios/*
+!/ios/Podfile
+!/ios/Podfile.lock
+!/ios/Podfile.properties.json
+/android/*
