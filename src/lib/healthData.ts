@@ -127,40 +127,67 @@ const IOS_READ_TYPES: Array<
   | "HRV"
 > = ["HeartRate", "RestingHeartRate", "Steps", "Sleep", "BodyTemperature", "ActiveEnergy", "HRV"];
 
-export async function requestHealthPermissions(): Promise<boolean> {
-  if (Platform.OS === "web") return false;
+export type HealthPermissionResult =
+  | { ok: true }
+  | { ok: false; reason: string };
+
+export async function requestHealthPermissions(): Promise<HealthPermissionResult> {
+  if (Platform.OS === "web") {
+    return { ok: false, reason: "当前为网页环境，无法使用系统健康数据。" };
+  }
 
   if (Platform.OS === "ios") {
     const kit = getIosHealthKit();
-    if (!kit?.isAvailable()) return false;
+    if (!kit) {
+      return {
+        ok: false,
+        reason:
+          "未加载 HealthKit 原生模块。请使用本仓库 development build 安装的应用（如 npx expo run:ios --device），不要使用 Expo Go。",
+      };
+    }
+    if (!kit.isAvailable()) {
+      return {
+        ok: false,
+        reason: "HealthKit 不可用：请在实体 iPhone 上运行（模拟器不支持 HealthKit）。",
+      };
+    }
     try {
       await kit.requestAuthorization(IOS_READ_TYPES, []);
       await initIosMenstrualHealthKit();
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        ok: false,
+        reason: msg.trim() || "授权请求抛出异常（也可查看 Metro / Xcode 日志）。",
+      };
     }
   }
 
   if (Platform.OS === "android") {
     const hc = getAndroidHealthConnect();
-    if (!hc) return false;
+    if (!hc) {
+      return { ok: false, reason: "未加载 Health Connect 模块（需 development build）。" };
+    }
     try {
       const status = await hc.getSdkStatus();
       const { SdkAvailabilityStatus } = hc;
       if (status !== SdkAvailabilityStatus.SDK_AVAILABLE) {
-        return false;
+        return { ok: false, reason: "Health Connect 在当前设备上不可用（需 Android 14+ 并已安装 Health Connect）。" };
       }
       const ok = await hc.initialize();
-      if (!ok) return false;
+      if (!ok) {
+        return { ok: false, reason: "Health Connect 初始化失败。" };
+      }
       await hc.requestPermission(ANDROID_READ_PERMISSIONS);
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false, reason: msg.trim() || "Health Connect 授权失败。" };
     }
   }
 
-  return false;
+  return { ok: false, reason: "不支持的平台。" };
 }
 
 export async function checkHealthPermissions(): Promise<boolean> {
@@ -522,8 +549,7 @@ async function fetchAndroidRange(startDate: Date, endDate: Date): Promise<{
   return out;
 }
 
-/** Last 7 days of samples (platform-specific). */
-export async function fetchRecentHealthData(): Promise<{
+export type RecentHealthPayload = {
   heartRate: HealthDataPoint[];
   hrv: HealthDataPoint[];
   sleep: HealthDataPoint[];
@@ -532,10 +558,17 @@ export async function fetchRecentHealthData(): Promise<{
   menstrualFlow: HealthDataPoint[];
   restingHeartRate: HealthDataPoint[];
   activeEnergy: HealthDataPoint[];
-}> {
+};
+
+/**
+ * Recent samples (platform-specific).
+ * @param options.lookbackDays — default 7 for routine sync; use a larger window (e.g. 120) only when inferring cycles from menstruation.
+ */
+export async function fetchRecentHealthData(options?: { lookbackDays?: number }): Promise<RecentHealthPayload> {
+  const lookbackDays = Math.min(Math.max(options?.lookbackDays ?? 7, 1), 365);
   const endDate = new Date();
   const startDate = new Date();
-  startDate.setDate(startDate.getDate() - 7);
+  startDate.setDate(startDate.getDate() - lookbackDays);
 
   if (Platform.OS === "ios") {
     return fetchIosRange(startDate, endDate);

@@ -1,36 +1,56 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { sendChatMessage } from "../lib/anthropic";
+import { createAttachmentSignedUrl, uploadPendingAttachments } from "../lib/chatAttachmentUpload";
 import { supabase } from "../lib/supabase";
+
+import type { ChatAttachmentMeta } from "../types/chatAttachment";
+import type { PendingAttachment } from "../types/chatAttachment";
 
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  attachments?: ChatAttachmentMeta[];
 }
 
 interface UseChatReturn {
   messages: ChatMessage[];
   isLoading: boolean;
   error: string | null;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, pendingAttachments?: PendingAttachment[]) => Promise<void>;
   loadSession: (sessionId: string) => Promise<void>;
   createNewSession: () => Promise<void>;
   currentSessionId: string | null;
 }
 
-function toChatMessage(row: {
+async function enrichAttachmentsWithUrls(msg: ChatMessage): Promise<ChatMessage> {
+  if (msg.role !== "user" || !msg.attachments?.length) return msg;
+  const enriched = await Promise.all(
+    msg.attachments.map(async (a) => {
+      if (a.kind !== "image") return a;
+      const signed_url = await createAttachmentSignedUrl(a.storage_path);
+      return { ...a, signed_url: signed_url ?? undefined };
+    }),
+  );
+  return { ...msg, attachments: enriched };
+}
+
+function rowToChatMessage(row: {
   id: string;
   role: string;
   content: string;
   created_at: string;
+  metadata?: unknown;
 }): ChatMessage {
+  const meta = row.metadata as { attachments?: ChatAttachmentMeta[] } | null | undefined;
   return {
     id: row.id,
     role: row.role as "user" | "assistant",
     content: row.content,
     createdAt: row.created_at,
+    attachments: meta?.attachments,
   };
 }
 
@@ -40,7 +60,6 @@ export function useChat(): UseChatReturn {
   const [error, setError] = useState<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
 
-  /** Start a fresh thread locally; first message will create the session on the server. */
   const createNewSession = useCallback(async () => {
     setCurrentSessionId(null);
     setMessages([]);
@@ -65,7 +84,9 @@ export function useChat(): UseChatReturn {
       setCurrentSessionId(sessionId);
       return;
     }
-    setMessages(list.map((item) => toChatMessage(item as never)));
+
+    const mapped = await Promise.all(list.map((item) => enrichAttachmentsWithUrls(rowToChatMessage(item as never))));
+    setMessages(mapped);
     setCurrentSessionId(sessionId);
   }, []);
 
@@ -91,30 +112,40 @@ export function useChat(): UseChatReturn {
   }, [loadSession]);
 
   const send = useCallback(
-    async (content: string) => {
+    async (content: string, pendingAttachments?: PendingAttachment[]) => {
       const trimmed = content.trim();
-      if (!trimmed || isLoading) return;
+      const hasFiles = Boolean(pendingAttachments?.length);
+      if ((!trimmed && !hasFiles) || isLoading) return;
 
       setIsLoading(true);
       setError(null);
 
+      const displayText = trimmed || "（见附件）";
       const tempUserId = `${Date.now()}-user`;
       const optimisticUser: ChatMessage = {
         id: tempUserId,
         role: "user",
-        content: trimmed,
+        content: displayText,
         createdAt: new Date().toISOString(),
       };
+
       setMessages((prev) => [...prev, optimisticUser]);
 
       try {
         const { data: authData } = await supabase.auth.getUser();
-        if (!authData.user?.id) {
+        const uid = authData.user?.id;
+        if (!uid) {
           setMessages((prev) => prev.filter((m) => m.id !== tempUserId));
           throw new Error("请先登录后再发送消息。");
         }
 
-        const response = await sendChatMessage(trimmed, currentSessionId);
+        let refs = undefined;
+        if (hasFiles && pendingAttachments) {
+          refs = await uploadPendingAttachments(uid, pendingAttachments);
+        }
+
+        const textForApi = trimmed || "（见附件）";
+        const response = await sendChatMessage(textForApi, currentSessionId, refs);
 
         setCurrentSessionId(response.session_id);
         await loadSession(response.session_id);

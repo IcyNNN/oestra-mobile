@@ -1,6 +1,8 @@
 import { useMemo } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
   ScrollView,
   Text,
   View,
@@ -16,7 +18,11 @@ export default function ChatScreen() {
   const hasMessages = useMemo(() => messages.length > 0, [messages.length]);
 
   return (
-    <View className="flex-1 bg-oestra-cream">
+    <KeyboardAvoidingView
+      className="flex-1 bg-oestra-cream"
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      keyboardVerticalOffset={Platform.OS === "ios" ? 64 : 0}
+    >
       <View className="border-b border-oestra-mist px-6 pb-4 pt-14">
         <Text className="font-serif-medium text-3xl text-oestra-purple">对话</Text>
       </View>
@@ -36,6 +42,7 @@ export default function ChatScreen() {
             role={message.role}
             content={message.content}
             timestamp={message.createdAt}
+            attachments={message.attachments}
           />
         ))}
 
@@ -52,6 +59,6 @@ export default function ChatScreen() {
       </ScrollView>
 
       <ChatInput loading={isLoading} onSend={sendMessage} />
-    </View>
+    </KeyboardAvoidingView>
   );
 }

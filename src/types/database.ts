@@ -203,7 +203,7 @@ export interface SymptomLog {
 }
 
 /** symptom_logs.source */
-export type SymptomLogSource = "manual" | "healthkit" | "health_connect";
+export type SymptomLogSource = "manual" | "healthkit" | "health_connect" | "chat_import";
 
 /** 对话会话（public.chat_sessions） */
 export interface ChatSession {

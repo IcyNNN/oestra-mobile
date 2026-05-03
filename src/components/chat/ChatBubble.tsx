@@ -1,10 +1,13 @@
 import { Moon } from "lucide-react-native";
-import { Text, View } from "react-native";
+import { Image, Text, View } from "react-native";
+
+import type { ChatAttachmentMeta } from "../../types/chatAttachment";
 
 interface ChatBubbleProps {
   role: "user" | "assistant";
   content: string;
   timestamp?: string;
+  attachments?: ChatAttachmentMeta[];
 }
 
 function formatTime(iso?: string) {
@@ -13,7 +16,7 @@ function formatTime(iso?: string) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-export function ChatBubble({ role, content, timestamp }: ChatBubbleProps) {
+export function ChatBubble({ role, content, timestamp, attachments }: ChatBubbleProps) {
   const isUser = role === "user";
   return (
     <View className={`mb-3 flex-row ${isUser ? "justify-end" : "justify-start"}`}>
@@ -29,6 +32,27 @@ export function ChatBubble({ role, content, timestamp }: ChatBubbleProps) {
             : "rounded-2xl rounded-bl-md bg-white"
         }`}
       >
+        {attachments?.length ? (
+          <View className="mb-2 gap-2">
+            {attachments.map((a) =>
+              a.kind === "image" && a.signed_url ? (
+                <Image
+                  key={a.storage_path}
+                  source={{ uri: a.signed_url }}
+                  className="h-40 w-full max-w-[240px] rounded-xl"
+                  resizeMode="cover"
+                  accessibilityLabel={a.file_name}
+                />
+              ) : (
+                <View key={a.storage_path} className="rounded-xl bg-white/60 px-3 py-2">
+                  <Text className="font-sans text-xs text-oestra-purple">
+                    {a.kind === "image" ? "图片" : "附件"} · {a.file_name}
+                  </Text>
+                </View>
+              ),
+            )}
+          </View>
+        ) : null}
         <Text className="font-sans text-base leading-6 text-oestra-text">{content}</Text>
         {timestamp ? (
           <Text className="mt-1 text-right font-sans text-xs text-oestra-text-light">

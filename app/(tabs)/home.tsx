@@ -1,8 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
-import { Modal, Pressable, ScrollView, Text, View } from "react-native";
+import { useFocusEffect } from "@react-navigation/native";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Alert, Modal, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { VoiceTextInput } from "../../src/components/ui/VoiceTextInput";
+import { useCycleData } from "../../src/hooks/useCycleData";
+import {
+  extractCycleHintsFromText,
+  periodStartFromCycleDayN,
+  type CycleHintResult,
+} from "../../src/lib/cycleHints";
+import { persistCycleHintsForUser } from "../../src/lib/cyclePersistence";
+import { fetchLatestAppPeriodStart } from "../../src/lib/healthCycleConflict";
 import { supabase } from "../../src/lib/supabase";
 
 type CyclePhase = "menstrual" | "follicular" | "ovulation" | "luteal";
@@ -72,7 +81,13 @@ function inferTypeFromText(input: string): QuickType {
 }
 
 export default function HomeScreen() {
-  const [cycleDay, setCycleDay] = useState(1);
+  const { currentCycleDay, refresh: refreshCycle } = useCycleData();
+  const [cycleCorrectVisible, setCycleCorrectVisible] = useState(false);
+  const [correctionPeriodIso, setCorrectionPeriodIso] = useState("");
+  const [correctionCycleDay, setCorrectionCycleDay] = useState("");
+  const [correctionVoice, setCorrectionVoice] = useState("");
+  const [correctionBusy, setCorrectionBusy] = useState(false);
+
   const [selectedType, setSelectedType] = useState<QuickTypeOrFree | null>(null);
   const [recordInput, setRecordInput] = useState("");
   const [records, setRecords] = useState<DailyRecord[]>([]);
@@ -80,30 +95,22 @@ export default function HomeScreen() {
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [syncHint, setSyncHint] = useState<string | null>(null);
 
+  useFocusEffect(
+    useCallback(() => {
+      refreshCycle();
+    }, [refreshCycle]),
+  );
+
   useEffect(() => {
-    const loadCycleDay = async () => {
+    const loadUser = async () => {
       const { data: authData } = await supabase.auth.getUser();
       const userId = authData.user?.id;
       if (userId) {
         setCurrentUserId(userId);
         setStorageKey(`oestra-daily-records-${userId}`);
       }
-
-      const { data } = await supabase
-        .from("cycle_logs")
-        .select("created_at")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (!data?.[0]?.created_at) return;
-      const start = new Date(data[0].created_at).getTime();
-      const now = Date.now();
-      const diffDays = Math.max(1, Math.floor((now - start) / (1000 * 60 * 60 * 24)) + 1);
-      setCycleDay(diffDays);
     };
-
-    loadCycleDay();
+    loadUser();
   }, []);
 
   useEffect(() => {
@@ -119,6 +126,14 @@ export default function HomeScreen() {
         if (!error && data) {
           // Difference from Next.js typed DTOs: this migration maps flexible legacy columns defensively.
           const mapped = data
+            .filter((row: Record<string, unknown>) => {
+              const n = String(row.notes ?? "");
+              return (
+                n !== "manual_home_long_press" &&
+                n !== "chat_cycle_hint" &&
+                n !== "health_sync_override"
+              );
+            })
             .map((row: Record<string, unknown>) => {
               const createdAt =
                 String(row.created_at || row.logged_at || row.log_date || new Date().toISOString());
@@ -182,7 +197,7 @@ export default function HomeScreen() {
     loadRecords();
   }, [storageKey]);
 
-  const phase = useMemo(() => resolvePhase(cycleDay), [cycleDay]);
+  const phase = useMemo(() => resolvePhase(currentCycleDay), [currentCycleDay]);
   const phaseInfo = phaseText[phase];
   const todayKey = new Date().toISOString().slice(0, 10);
   const todaysRecords = records.filter((record) => record.createdAt.slice(0, 10) === todayKey);
@@ -240,6 +255,71 @@ export default function HomeScreen() {
     }
     setRecordInput("");
     setSelectedType(null);
+    refreshCycle();
+  };
+
+  const submitCycleCorrection = async () => {
+    if (!currentUserId) {
+      Alert.alert("请先登录", "登录后可以同步修正周期信息。");
+      return;
+    }
+
+    const hintsVoice = extractCycleHintsFromText(correctionVoice);
+    let periodStart = correctionPeriodIso.trim() || undefined;
+    const dayStr = correctionCycleDay.trim();
+    if (!periodStart && dayStr) {
+      const n = parseInt(dayStr, 10);
+      if (!Number.isNaN(n) && n >= 1) {
+        periodStart = periodStartFromCycleDayN(n) ?? undefined;
+      }
+    }
+    if (!periodStart && hintsVoice.periodStartIso) {
+      periodStart = hintsVoice.periodStartIso;
+    }
+
+    const hints: CycleHintResult = {
+      periodStartIso: periodStart,
+      typicalCycleLengthDays: hintsVoice.typicalCycleLengthDays,
+    };
+
+    if (!hints.periodStartIso && hints.typicalCycleLengthDays == null) {
+      Alert.alert(
+        "还需要一点信息",
+        "请填写上次月经开始的日期（YYYY-MM-DD）、今天是周期第几天，或用语音说出例如「上次月经 5 月 1 日」「今天是周期第 8 天」「典型周期 28 天」。",
+      );
+      return;
+    }
+
+    if (hints.periodStartIso) {
+      const existing = await fetchLatestAppPeriodStart(currentUserId);
+      if (existing && existing !== hints.periodStartIso) {
+        const ok = await new Promise<boolean>((resolve) => {
+          Alert.alert(
+            "覆盖周期起点？",
+            `当前记录的上次月经开始为 ${existing}，将改为 ${hints.periodStartIso}。是否覆盖？`,
+            [
+              { text: "取消", style: "cancel", onPress: () => resolve(false) },
+              { text: "覆盖", onPress: () => resolve(true) },
+            ],
+          );
+        });
+        if (!ok) return;
+      }
+    }
+
+    setCorrectionBusy(true);
+    try {
+      await persistCycleHintsForUser(currentUserId, hints, "manual_home_long_press");
+      await refreshCycle();
+      setCycleCorrectVisible(false);
+      setCorrectionPeriodIso("");
+      setCorrectionCycleDay("");
+      setCorrectionVoice("");
+    } catch (e) {
+      Alert.alert("保存失败", e instanceof Error ? e.message : "请稍后再试。");
+    } finally {
+      setCorrectionBusy(false);
+    }
   };
 
   return (
@@ -253,10 +333,25 @@ export default function HomeScreen() {
           {phaseInfo.line}
         </Text>
 
-        <View className="mt-8 items-center">
-          <Text className="font-sans-medium text-base text-oestra-text">周期第 {cycleDay} 天</Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityHint="长按可以修正周期起点或语音说明"
+          delayLongPress={450}
+          onLongPress={() => {
+            if (!currentUserId) {
+              Alert.alert("请先登录", "登录后可以修正并同步周期信息。");
+              return;
+            }
+            setCycleCorrectVisible(true);
+          }}
+          className="mt-8 items-center active:opacity-80"
+        >
+          <Text className="font-sans-medium text-base text-oestra-text">
+            周期第 {currentCycleDay} 天
+          </Text>
           <Text className="mt-1 font-sans text-sm text-oestra-text-light">{phaseInfo.label}</Text>
-        </View>
+          <Text className="mt-2 font-sans text-xs text-oestra-text-light">长按修正周期（支持语音）</Text>
+        </Pressable>
       </View>
 
       <View className="mt-16 rounded-3xl bg-white p-5">
@@ -308,6 +403,61 @@ export default function HomeScreen() {
           </View>
         )}
       </View>
+
+      <Modal visible={cycleCorrectVisible} transparent animationType="fade">
+        <View className="flex-1 items-center justify-center bg-black/30 px-8">
+          <View className="w-full rounded-3xl bg-white p-6">
+            <Text className="font-serif-medium text-2xl text-oestra-purple">修正周期信息</Text>
+            <Text className="mt-2 font-sans text-sm leading-6 text-oestra-text-light">
+              填写上次月经开始日，或告诉我们今天是周期第几天；也可口述「典型周期 28 天」等。
+            </Text>
+            <Text className="mt-4 font-sans-medium text-xs text-oestra-text-light">上次月经开始（YYYY-MM-DD）</Text>
+            <TextInput
+              value={correctionPeriodIso}
+              onChangeText={setCorrectionPeriodIso}
+              placeholder="例如 2026-04-24"
+              placeholderTextColor="#A89BB5"
+              className="mt-2 rounded-2xl border border-oestra-mist px-4 py-3 font-sans text-base text-oestra-text"
+            />
+            <Text className="mt-4 font-sans-medium text-xs text-oestra-text-light">今天是周期第几天（可选）</Text>
+            <TextInput
+              value={correctionCycleDay}
+              onChangeText={setCorrectionCycleDay}
+              keyboardType="number-pad"
+              placeholder="例如 8"
+              placeholderTextColor="#A89BB5"
+              className="mt-2 rounded-2xl border border-oestra-mist px-4 py-3 font-sans text-base text-oestra-text"
+            />
+            <VoiceTextInput
+              value={correctionVoice}
+              onChangeText={setCorrectionVoice}
+              multiline
+              placeholder="语音或打字：上次月经 4 月 24 日；今天是周期第 8 天；典型周期 28 天…"
+              className="mt-4"
+            />
+            <Pressable
+              disabled={correctionBusy}
+              onPress={submitCycleCorrection}
+              className="mt-4 items-center rounded-2xl bg-oestra-purple py-3 opacity-100 disabled:opacity-50"
+            >
+              <Text className="font-sans-bold text-sm text-white">
+                {correctionBusy ? "保存中…" : "保存并更新首页"}
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => {
+                setCycleCorrectVisible(false);
+                setCorrectionPeriodIso("");
+                setCorrectionCycleDay("");
+                setCorrectionVoice("");
+              }}
+              className="mt-4 items-end"
+            >
+              <Text className="font-sans-medium text-sm text-oestra-text-light">关闭</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
 
       <Modal visible={Boolean(selectedType)} transparent animationType="fade">
         <View className="flex-1 items-center justify-center bg-black/30 px-8">

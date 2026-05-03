@@ -1,5 +1,7 @@
 import { supabase } from "./supabase";
 
+import type { ChatAttachmentRef } from "../types/chatAttachment";
+
 /** Edge Function `chat` JSON response */
 export interface ChatEdgeResponse {
   session_id: string;
@@ -37,11 +39,13 @@ async function readInvokeErrorDetail(error: unknown): Promise<string> {
 async function invokeChatOnce(
   trimmed: string,
   sessionId: string | null | undefined,
+  attachments?: ChatAttachmentRef[],
 ): Promise<{ data: ChatEdgeResponse | null; error: unknown }> {
   return supabase.functions.invoke<ChatEdgeResponse>("chat", {
     body: {
       session_id: sessionId ?? undefined,
       message: trimmed,
+      attachments: attachments?.length ? attachments : undefined,
     },
   });
 }
@@ -52,13 +56,14 @@ async function invokeChatOnce(
 export async function sendChatMessage(
   message: string,
   sessionId?: string | null,
+  attachments?: ChatAttachmentRef[],
 ): Promise<ChatEdgeResponse> {
   const trimmed = message.trim();
-  if (!trimmed) {
-    throw new Error("消息不能为空。");
+  if (!trimmed && (!attachments || attachments.length === 0)) {
+    throw new Error("请输入文字或添加附件。");
   }
 
-  let { data, error } = await invokeChatOnce(trimmed, sessionId);
+  let { data, error } = await invokeChatOnce(trimmed, sessionId, attachments);
 
   // Stale or foreign session_id → 403; retry once without session so server creates a new chat_sessions row.
   if (error) {
@@ -68,7 +73,7 @@ export async function sendChatMessage(
       (detail.includes("Invalid session_id") || detail.includes("session_id for this user"));
 
     if (shouldRetryFresh) {
-      ({ data, error } = await invokeChatOnce(trimmed, null));
+      ({ data, error } = await invokeChatOnce(trimmed, null, attachments));
     }
 
   if (error) {

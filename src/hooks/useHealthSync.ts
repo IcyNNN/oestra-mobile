@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { checkHealthPermissions, requestHealthPermissions } from "../lib/healthData";
+import {
+  checkHealthPermissions,
+  requestHealthPermissions,
+  type HealthPermissionResult,
+} from "../lib/healthData";
 import { syncHealthData } from "../lib/healthSync";
 import { supabase } from "../lib/supabase";
 
@@ -15,10 +19,10 @@ export function useHealthSync() {
     setHasPermission(ok);
   }, []);
 
-  const requestPermission = useCallback(async () => {
-    const ok = await requestHealthPermissions();
-    setHasPermission(ok);
-    return ok;
+  const requestPermission = useCallback(async (): Promise<HealthPermissionResult> => {
+    const result = await requestHealthPermissions();
+    setHasPermission(result.ok);
+    return result;
   }, []);
 
   const syncNow = useCallback(async () => {

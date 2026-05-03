@@ -16,9 +16,17 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
+interface ChatAttachmentRef {
+  storage_path: string;
+  file_name: string;
+  mime_type: string;
+  kind: "image" | "file";
+}
+
 interface ChatRequestBody {
   session_id?: string | null;
   message: string;
+  attachments?: ChatAttachmentRef[];
 }
 
 function jsonResponse(body: unknown, status = 200) {
@@ -26,6 +34,151 @@ function jsonResponse(body: unknown, status = 200) {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
+}
+
+function base64FromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]!);
+  return btoa(binary);
+}
+
+async function resolveAttachmentPayload(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  raw: ChatAttachmentRef[],
+): Promise<{
+  meta: ChatAttachmentRef[];
+  imageBlocks: Record<string, unknown>[];
+  extractedText: string;
+}> {
+  if (!raw?.length) {
+    return { meta: [], imageBlocks: [], extractedText: "" };
+  }
+
+  const meta: ChatAttachmentRef[] = [];
+  const imageBlocks: Record<string, unknown>[] = [];
+  let extractedText = "";
+
+  const prefix = `${userId}/`;
+  for (const a of raw.slice(0, 8)) {
+    const path = typeof a.storage_path === "string" ? a.storage_path.trim() : "";
+    if (!path.startsWith(prefix)) {
+      continue;
+    }
+    const mimeRaw = (a.mime_type || "application/octet-stream").toLowerCase();
+    const name = String(a.file_name || "file").slice(0, 240);
+    const kind = a.kind === "image" ? "image" : "file";
+    meta.push({
+      storage_path: path,
+      file_name: name,
+      mime_type: mimeRaw,
+      kind,
+    });
+
+    const { data: blob, error } = await admin.storage.from("chat-attachments").download(path);
+    if (error || !blob) {
+      console.warn("attachment download:", path, error?.message);
+      continue;
+    }
+
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+
+    if (mimeRaw.startsWith("image/") && kind === "image") {
+      const media =
+        mimeRaw === "image/png"
+          ? "image/png"
+          : mimeRaw === "image/webp"
+            ? "image/webp"
+            : mimeRaw === "image/gif"
+              ? "image/gif"
+              : "image/jpeg";
+      imageBlocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: media,
+          data: base64FromBytes(bytes),
+        },
+      });
+    } else if (
+      mimeRaw.includes("text") ||
+      mimeRaw.includes("csv") ||
+      mimeRaw.includes("json") ||
+      name.endsWith(".csv") ||
+      name.endsWith(".txt") ||
+      name.endsWith(".json")
+    ) {
+      try {
+        const text = new TextDecoder().decode(bytes);
+        extractedText += `\n\n--- 文件: ${name} ---\n${text.slice(0, 80000)}`;
+      } catch (_) {
+        extractedText += `\n\n--- 文件: ${name} — 文本解码失败 ---\n`;
+      }
+    } else {
+      extractedText += `\n\n--- 文件: ${name} (${mimeRaw}) — 未展开二进制；若与健康相关请结合截图或文字说明 ---\n`;
+    }
+  }
+
+  return { meta, imageBlocks, extractedText };
+}
+
+async function ingestSymptomRowsFromAttachmentText(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  extractedText: string,
+): Promise<{ inserted: number }> {
+  const t = extractedText.trim();
+  if (t.length < 12) return { inserted: 0 };
+
+  const lines = t.split(/\r?\n/).slice(0, 300);
+  let inserted = 0;
+  const isoRe = /(\d{4}-\d{2}-\d{2})/;
+
+  for (const line of lines) {
+    const m = line.match(isoRe);
+    if (!m) continue;
+    const day = m[1]!;
+    const rest = line.replace(m[0]!, "").trim().slice(0, 800);
+    if (rest.length < 2) continue;
+
+    const { error } = await admin.from("symptom_logs").insert({
+      user_id: userId,
+      logged_on: day,
+      log_type: "attachment_note",
+      symptom: rest,
+      severity: null,
+      notes: "chat_attachment_import",
+      source: "chat_import",
+    });
+    if (!error) inserted += 1;
+    if (inserted >= 100) break;
+  }
+
+  return { inserted };
+}
+
+function buildAnthropicMessages(
+  rows: { role: string; content: string }[],
+  extraTextForLastUser: string,
+  imageBlocks: Record<string, unknown>[],
+): { role: string; content: unknown }[] {
+  const out: { role: string; content: unknown }[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    const isLastUser = i === rows.length - 1 && row.role === "user";
+    if (isLastUser && (extraTextForLastUser.length > 0 || imageBlocks.length > 0)) {
+      let text = row.content;
+      if (extraTextForLastUser.trim()) {
+        text += `\n\n--- 附件文本摘录 ---\n${extraTextForLastUser.slice(0, 90000)}`;
+      }
+      const content: unknown[] = [{ type: "text", text }, ...imageBlocks];
+      out.push({ role: "user", content });
+    } else {
+      out.push({ role: row.role, content: row.content });
+    }
+  }
+  return out;
 }
 
 Deno.serve(async (req: Request) => {
@@ -76,9 +229,22 @@ Deno.serve(async (req: Request) => {
     }
 
     const message = typeof body.message === "string" ? body.message.trim() : "";
-    if (!message) {
-      return jsonResponse({ error: "message is required" }, 400);
+    const attachmentsIn = Array.isArray(body.attachments) ? body.attachments : [];
+    if (!message && attachmentsIn.length === 0) {
+      return jsonResponse({ error: "message or attachments is required" }, 400);
     }
+
+    let attachmentPayload = null;
+    try {
+      attachmentPayload = await resolveAttachmentPayload(admin, user.id, attachmentsIn);
+    } catch (e) {
+      console.error("resolveAttachmentPayload:", e);
+      return jsonResponse({ error: "Could not load attachments" }, 400);
+    }
+
+    const sessionTitle =
+      message.slice(0, 50) ||
+      (attachmentsIn[0]?.file_name ? String(attachmentsIn[0].file_name).slice(0, 50) : "附件");
 
     let currentSessionId = body.session_id?.trim() || "";
 
@@ -98,7 +264,7 @@ Deno.serve(async (req: Request) => {
         .from("chat_sessions")
         .insert({
           user_id: user.id,
-          title: message.slice(0, 50),
+          title: sessionTitle,
           session_type: "chat",
           created_at: nowIso,
           updated_at: nowIso,
@@ -112,15 +278,44 @@ Deno.serve(async (req: Request) => {
       currentSessionId = newSession.id as string;
     }
 
+    const userDisplayContent = message || "（见附件）";
+    const userMetadata =
+      attachmentPayload?.meta?.length > 0 ? { attachments: attachmentPayload.meta } : null;
+
     const { error: userMsgErr } = await admin.from("chat_messages").insert({
       session_id: currentSessionId,
       user_id: user.id,
       role: "user",
-      content: message,
+      content: userDisplayContent,
+      metadata: userMetadata,
     });
     if (userMsgErr) {
       console.error("chat_messages user insert:", userMsgErr);
       return jsonResponse({ error: "Could not save user message" }, 500);
+    }
+
+    const hintSource =
+      message +
+      (attachmentPayload?.extractedText
+        ? `\n\n${attachmentPayload.extractedText.slice(0, 12000)}`
+        : "");
+
+    let cycleHintsApplied = null;
+    try {
+      cycleHintsApplied = await applyCycleHintsFromUserMessage(admin, user.id, hintSource);
+    } catch (e) {
+      console.error("applyCycleHintsFromUserMessage:", e);
+    }
+
+    let healthImportResult = { inserted: 0 };
+    try {
+      healthImportResult = await ingestSymptomRowsFromAttachmentText(
+        admin,
+        user.id,
+        attachmentPayload?.extractedText ?? "",
+      );
+    } catch (e) {
+      console.error("ingestSymptomRowsFromAttachmentText:", e);
     }
 
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
@@ -182,12 +377,15 @@ Deno.serve(async (req: Request) => {
       healthDeviceRows,
     });
 
-    const conversationHistory = historyChrono
-      .filter((m: { role: string }) => m.role === "user" || m.role === "assistant")
-      .map((m: { role: string; content: string }) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      }));
+    const historyRows = historyChrono.filter(
+      (m: { role: string }) => m.role === "user" || m.role === "assistant",
+    ) as { role: string; content: string }[];
+
+    const anthropicMessages = buildAnthropicMessages(
+      historyRows,
+      attachmentPayload?.extractedText ?? "",
+      attachmentPayload?.imageBlocks ?? [],
+    );
 
     const anthropicResp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -200,7 +398,7 @@ Deno.serve(async (req: Request) => {
         model: Deno.env.get("ANTHROPIC_MODEL") ?? "claude-sonnet-4-5-20250929",
         max_tokens: 1024,
         system: systemPrompt,
-        messages: conversationHistory,
+        messages: anthropicMessages,
       }),
     });
 
@@ -225,7 +423,11 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ error: "No AI reply text in response" }, 502);
     }
 
-    const metadata = extractBasicMetadata(message, aiReply);
+    const metadata = mergeChatMetadata(
+      extractBasicMetadata(message, aiReply),
+      cycleHintsApplied,
+      healthImportResult.inserted > 0 ? { health_import_rows: healthImportResult.inserted } : null,
+    );
 
     const { error: asstErr } = await admin.from("chat_messages").insert({
       session_id: currentSessionId,
@@ -397,6 +599,140 @@ ${insightSummary}
 # 当你不确定时
 不要编。说「这件事我不确定，建议你问一下专业的医生。」
 `;
+}
+
+/** Mirrors src/lib/cycleHints.ts — keep regexes aligned when changing parsing rules. */
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function edgeUtcTodayIso(): string {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+function edgeShiftIsoDate(iso: string, deltaDays: number): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso.trim());
+  if (!m) return null;
+  const dt = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  if (Number.isNaN(dt.getTime())) return null;
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  return `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+}
+
+function edgePeriodStartFromCycleDayN(cycleDay: number, todayIso = edgeUtcTodayIso()): string | null {
+  if (!Number.isFinite(cycleDay) || cycleDay < 1 || cycleDay > 80) return null;
+  return edgeShiftIsoDate(todayIso, -(cycleDay - 1));
+}
+
+function extractCycleHintsFromUserText(text: string): {
+  periodStartIso?: string;
+  typicalCycleLengthDays?: number;
+} {
+  const raw = text.trim();
+  if (!raw) return {};
+
+  const out: { periodStartIso?: string; typicalCycleLengthDays?: number } = {};
+
+  const typical = raw.match(/(?:典型\s*)?周期\s*(?:长度|长约)?\s*(\d{1,2})\s*天/);
+  if (typical) {
+    const n = parseInt(typical[1], 10);
+    if (n >= 21 && n <= 45) {
+      out.typicalCycleLengthDays = n;
+    }
+  }
+
+  const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (iso) {
+    const candidate = iso[1];
+    const d = new Date(candidate + "T12:00:00Z");
+    if (!Number.isNaN(d.getTime())) {
+      out.periodStartIso = candidate;
+    }
+  }
+
+  const dayPatterns = [
+    /(?:经期|周期)\s*第\s*(\d{1,2})\s*天/,
+    /今天(?:是)?\s*周期\s*第\s*(\d{1,2})\s*天/,
+    /第\s*(\d{1,2})\s*天\s*(?:了)?(?:周期|经期)/,
+  ];
+  for (const re of dayPatterns) {
+    const dm = raw.match(re);
+    if (dm) {
+      const n = parseInt(dm[1], 10);
+      const start = edgePeriodStartFromCycleDayN(n);
+      if (start) {
+        out.periodStartIso = start;
+        break;
+      }
+    }
+  }
+
+  return out;
+}
+
+async function applyCycleHintsFromUserMessage(
+  admin: ReturnType<typeof createClient>,
+  userId: string,
+  message: string,
+): Promise<Record<string, unknown> | null> {
+  const hints = extractCycleHintsFromUserText(message);
+  const applied: Record<string, unknown> = {};
+
+  if (hints.typicalCycleLengthDays != null) {
+    const { data: hp } = await admin.from("hormone_profiles").select("user_id").eq("user_id", userId).maybeSingle();
+    const nowIso = new Date().toISOString();
+    if (hp) {
+      const { error } = await admin
+        .from("hormone_profiles")
+        .update({
+          typical_cycle_length_days: hints.typicalCycleLengthDays,
+          updated_at: nowIso,
+        })
+        .eq("user_id", userId);
+      if (error) throw error;
+    } else {
+      const { error } = await admin.from("hormone_profiles").insert({
+        user_id: userId,
+        goals: [],
+        typical_cycle_length_days: hints.typicalCycleLengthDays,
+        onboarding_completed: false,
+        created_at: nowIso,
+        updated_at: nowIso,
+      });
+      if (error) throw error;
+    }
+    applied.typical_cycle_length_days = hints.typicalCycleLengthDays;
+  }
+
+  if (hints.periodStartIso) {
+    const { error } = await admin.from("cycle_logs").insert({
+      user_id: userId,
+      period_start: hints.periodStartIso,
+      period_end: null,
+      flow_intensity: null,
+      notes: "chat_cycle_hint",
+    });
+    if (error) throw error;
+    applied.period_start = hints.periodStartIso;
+  }
+
+  return Object.keys(applied).length > 0 ? applied : null;
+}
+
+function mergeChatMetadata(
+  basic: Record<string, unknown> | null,
+  cycleHints: Record<string, unknown> | null,
+  extra: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  const out: Record<string, unknown> = { ...(basic ?? {}) };
+  if (cycleHints && Object.keys(cycleHints).length > 0) {
+    out.cycle_hints_applied = cycleHints;
+  }
+  if (extra && Object.keys(extra).length > 0) {
+    Object.assign(out, extra);
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 function extractBasicMetadata(

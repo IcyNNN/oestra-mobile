@@ -7,7 +7,7 @@ ALTER TABLE public.symptom_logs
   ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'manual';
 
 COMMENT ON COLUMN public.symptom_logs.source IS
-  'manual | healthkit | health_connect';
+  'manual | healthkit | health_connect | chat_import';
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_symptom_logs_health_sync
   ON public.symptom_logs (user_id, logged_on, log_type, source)

@@ -1,6 +1,7 @@
+import { TaskHintIOS } from "expo-speech-recognition";
 import { Mic } from "lucide-react-native";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, Pressable, Text, TextInput, View, type TextInputProps } from "react-native";
+import { Alert, Platform, Pressable, Text, TextInput, View, type TextInputProps } from "react-native";
 import type { EventSubscription } from "react-native";
 
 import { getDefaultSpeechRecognitionLang } from "../../utils/speechLocale";
@@ -14,7 +15,13 @@ interface VoiceTextInputProps extends TextInputProps {
 type ExpoSpeechPkg = {
   ExpoSpeechRecognitionModule: {
     requestPermissionsAsync: () => Promise<{ granted: boolean }>;
-    start: (options: { lang: string; interimResults: boolean; continuous: boolean }) => void;
+    start: (options: {
+      lang: string;
+      interimResults: boolean;
+      continuous: boolean;
+      iosTaskHint?: string;
+      addsPunctuation?: boolean;
+    }) => void;
     stop: () => void;
     addListener: (event: string, cb: (payload: unknown) => void) => EventSubscription;
   };
@@ -119,6 +126,10 @@ export function VoiceTextInput({
         lang: speechLang,
         interimResults: true,
         continuous: true,
+        // iOS：用「听写」任务提示 + 标点，中文识别效果通常明显好于默认 unspecified
+        ...(Platform.OS === "ios"
+          ? { iosTaskHint: TaskHintIOS.dictation, addsPunctuation: true }
+          : {}),
       });
     } catch (e) {
       clearSubscriptions();

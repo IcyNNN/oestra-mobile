@@ -1,23 +1,32 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { calendarDaysSincePeriodStart, parsePeriodStartDate } from "../lib/cycleHints";
 import { supabase } from "../lib/supabase";
 
 type CyclePhase = "menstrual" | "follicular" | "ovulation" | "luteal";
 
-interface CycleLog {
+interface CycleLogRow {
   id: string;
-  cycle_start_date: string | null;
+  period_start?: string | null;
+  cycle_start_date?: string | null;
   created_at: string;
-  [key: string]: unknown;
+}
+
+function latestPeriodStartLog(logs: CycleLogRow[]): CycleLogRow | undefined {
+  for (const log of logs) {
+    if (log.period_start) return log;
+  }
+  return undefined;
 }
 
 interface UseCycleDataReturn {
-  cycleLogs: CycleLog[];
+  cycleLogs: CycleLogRow[];
   isLoading: boolean;
   error: string | null;
   currentCycleDay: number;
   currentPhase: CyclePhase;
   nextPeriodDate: Date | null;
+  typicalCycleLengthDays: number;
   refresh: () => Promise<void>;
 }
 
@@ -28,14 +37,9 @@ function calculatePhase(cycleDay: number): CyclePhase {
   return "luteal";
 }
 
-function startFromLog(log: CycleLog | undefined): Date | null {
-  if (!log) return null;
-  const source = log.cycle_start_date || log.created_at;
-  return source ? new Date(source) : null;
-}
-
 export function useCycleData(): UseCycleDataReturn {
-  const [cycleLogs, setCycleLogs] = useState<CycleLog[]>([]);
+  const [cycleLogs, setCycleLogs] = useState<CycleLogRow[]>([]);
+  const [typicalCycleLengthDays, setTypicalCycleLengthDays] = useState(28);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -47,21 +51,31 @@ export function useCycleData(): UseCycleDataReturn {
       const userId = authData.user?.id;
       if (!userId) {
         setCycleLogs([]);
+        setTypicalCycleLengthDays(28);
         return;
       }
 
-      // Difference from Next.js data fetching: cycle data is loaded from client hook in RN runtime.
-      const { data, error: fetchError } = await supabase
-        .from("cycle_logs")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false });
+      const [{ data: hpRow }, { data, error: fetchError }] = await Promise.all([
+        supabase.from("hormone_profiles").select("typical_cycle_length_days").eq("user_id", userId).maybeSingle(),
+        supabase
+          .from("cycle_logs")
+          .select("*")
+          .eq("user_id", userId)
+          .order("period_start", { ascending: false, nullsFirst: false })
+          .order("created_at", { ascending: false }),
+      ]);
 
       if (fetchError) {
         throw new Error(fetchError.message);
       }
 
-      setCycleLogs((data as CycleLog[] | null) ?? []);
+      const t =
+        hpRow && typeof (hpRow as { typical_cycle_length_days?: number | null }).typical_cycle_length_days === "number"
+          ? (hpRow as { typical_cycle_length_days: number }).typical_cycle_length_days
+          : null;
+      setTypicalCycleLengthDays(t != null && t > 0 ? t : 28);
+
+      setCycleLogs((data as CycleLogRow[] | null) ?? []);
     } catch (e) {
       setError(e instanceof Error ? e.message : "无法加载周期数据。");
     } finally {
@@ -74,21 +88,24 @@ export function useCycleData(): UseCycleDataReturn {
   }, [refresh]);
 
   const currentCycleDay = useMemo(() => {
-    const start = startFromLog(cycleLogs[0]);
-    if (!start) return 1;
-    const diff = Math.floor((Date.now() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1;
-    return Math.max(1, diff);
+    const log = latestPeriodStartLog(cycleLogs);
+    const ps = log?.period_start?.trim();
+    if (!ps) return 1;
+    return calendarDaysSincePeriodStart(ps);
   }, [cycleLogs]);
 
   const currentPhase = useMemo(() => calculatePhase(currentCycleDay), [currentCycleDay]);
 
   const nextPeriodDate = useMemo(() => {
-    const start = startFromLog(cycleLogs[0]);
+    const log = latestPeriodStartLog(cycleLogs);
+    const ps = log?.period_start?.trim();
+    if (!ps) return null;
+    const start = parsePeriodStartDate(ps);
     if (!start) return null;
     const next = new Date(start);
-    next.setDate(next.getDate() + 28);
+    next.setDate(next.getDate() + typicalCycleLengthDays);
     return next;
-  }, [cycleLogs]);
+  }, [cycleLogs, typicalCycleLengthDays]);
 
   return {
     cycleLogs,
@@ -97,6 +114,7 @@ export function useCycleData(): UseCycleDataReturn {
     currentCycleDay,
     currentPhase,
     nextPeriodDate,
+    typicalCycleLengthDays,
     refresh,
   };
 }

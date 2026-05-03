@@ -59,6 +59,8 @@ Some networks block `*.supabase.co`; try another network or VPN if fetch still f
 
 The app calls **`supabase.functions.invoke("chat")`**, which validates the user JWT, loads profile/context from Postgres, calls Anthropic on the server, and saves `chat_messages` (including assistant `metadata`). **Do not put Anthropic API keys in `.env`.**
 
+**chat attachments:** Create Storage bucket **`chat-attachments`** (private) in the Supabase **Dashboard → Storage** first — SQL cannot insert into `storage.buckets` on hosted projects (`must be owner of table buckets`). Then run migration **`003_chat_attachments_storage.sql`** (RLS policies only). The Edge Function **`chat`** downloads files server-side, sends **images** to Claude as vision blocks and **text/CSV** as excerpt text; structured rows with dates may be inserted into **`symptom_logs`** with **`source = chat_import`**. Deploy **`npm run deploy:chat`** after pulling these changes.
+
 若终端提示 `command not found: supabase`，说明未全局安装 CLI。可直接用 **`npx supabase`**（无需安装），或本项目已加入开发依赖，安装后用 **`npm run deploy:chat`**。
 
 ```bash
@@ -83,6 +85,15 @@ HealthKit 与 Health Connect **不能在 Expo Go 里使用**，需要 **developm
 3. 本地生成原生工程并安装到真机：`npx expo prebuild` → `npx expo run:ios`（HealthKit 需真机）或 `npx expo run:android`（Android 14+ Health Connect）。
 
 在 **我的** 页可「连接健康数据授权」与「同步最近7天到云端」。同步写入 `symptom_logs`（`source` = `healthkit` / `health_connect`）。
+
+### iOS HealthKit 授权找不到入口 / `HealthKitError`
+
+- **系统界面**：健康数据开关在 **「设置 → 隐私与安全性 → 健康 → 数据访问与设备」**，不在 **「设置 → Oestra」** 里；后者只会出现麦克风、本地网络等。
+- **必须重新打原生包**：修改过 `app.config.ts` / Health 插件 / `app.json` 里的 `ios.entitlements` 后，需要重新生成 `ios` 并安装到真机，例如：`npx expo prebuild --clean` → `npx expo run:ios --device`（勿指望仅靠 Metro 热更新）。
+- **必须使用付费 Apple Developer Program（约 $99/年）**：仅用 Apple ID 登录 Xcode 时的 **Personal Team（个人免费团队）无法为带 HealthKit entitlement 的 App 生成有效的开发描述文件**，`xcodebuild` 会失败（常见文案包含 *Personal development teams … do not support*、*HealthKit*、*Verifiable Health Records*、exit code **65**）。需要 [加入开发者计划](https://developer.apple.com/programs/enroll/) 后，在 **Certificates, Identifiers & Profiles** 里为 **`com.oestra.app`** 启用 **HealthKit**，再在 Xcode 里把 **Team** 选成该付费账号下的 Team，重新 **Run**。
+- **付款审核未生效前的兜底构建**：设置 **`SKIP_HEALTHKIT=true`**（可写在项目根目录 `.env`，或对单次命令 `SKIP_HEALTHKIT=true npx expo prebuild --clean`）。这样会**不包含** HealthKit / Health Connect / `react-native-health` 插件，并去掉 `ios` 里与健康相关的 entitlement，**Personal Team 也能签名**，便于继续调试其它功能。生效后在 Portal / Xcode 配好付费 Team，**删掉 `.env` 里的该项或设为 false**，再 **`npx expo prebuild --clean`** → **`npx expo run:ios --device`** 打回「完整健康能力」包。`我的` 页在兜底构建下会显示说明并禁用健康授权按钮（由 `EXPO_PUBLIC_SKIP_HEALTH_NATIVE` 注入）。
+- **Apple Developer（付费账号）**：打开 [Identifiers](https://developer.apple.com/account/resources/identifiers/list)，选中 **Bundle ID `com.oestra.app`**，在 **Capabilities** 里勾选 **HealthKit** 并保存；再用 Xcode 打开 `ios/Oestra.xcworkspace`，**Signing & Capabilities** 中应出现 **HealthKit**（若没有，点「+ Capability」手动添加）。
+- 仍报 `expo_healthkit.HealthKitError` 时：删除手机上的 App 后重装，并在 **健康** 里确认曾弹出过授权框（若从未弹出，多半是 entitlement 未打进当前安装包）。
 
 ## Voice input (speech-to-text)
 
